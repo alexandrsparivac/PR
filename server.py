@@ -1,52 +1,115 @@
 import socket
 import threading
+import json
 
 HOST = '127.0.0.1'
 PORT = 65432
 
-clients = []
+# Dict: nickname -> {socket, address}
+clients = {}
 clients_lock = threading.Lock()
 
 
-def broadcast(message, sender_socket=None):
+def send_to_client(client_socket, msg_type, data):
+    """Trimite un mesaj JSON către un client."""
+    message = json.dumps({"type": msg_type, "data": data})
+    try:
+        client_socket.sendall(message.encode('utf-8'))
+    except:
+        pass
+
+
+def broadcast(msg_type, data, exclude_nickname=None):
     """Trimite mesajul către toți clienții conectați."""
     with clients_lock:
-        for client in clients[:]:
-            try:
-                client.sendall(message)
-            except:
-                clients.remove(client)
+        for nickname, info in list(clients.items()):
+            if nickname != exclude_nickname:
+                send_to_client(info['socket'], msg_type, data)
+
+
+def get_user_list():
+    """Returnează lista de utilizatori conectați."""
+    with clients_lock:
+        return list(clients.keys())
 
 
 def handle_client(client_socket, address):
     """Gestionează comunicarea cu un client individual."""
-    print(f"[CONEXIUNE NOUĂ] {address} s-a conectat.")
-    
-    with clients_lock:
-        clients.append(client_socket)
+    nickname = None
     
     try:
+        # Primește nickname-ul
+        data = client_socket.recv(1024)
+        if not data:
+            return
+        
+        msg = json.loads(data.decode('utf-8'))
+        if msg['type'] == 'register':
+            nickname = msg['data']['nickname']
+            
+            with clients_lock:
+                if nickname in clients:
+                    send_to_client(client_socket, 'error', {'message': 'Nickname-ul este deja folosit!'})
+                    client_socket.close()
+                    return
+                clients[nickname] = {'socket': client_socket, 'address': address}
+            
+            print(f"[CONEXIUNE NOUĂ] {nickname} ({address}) s-a conectat.")
+            send_to_client(client_socket, 'registered', {'nickname': nickname, 'ip': address[0], 'port': address[1]})
+            broadcast('notification', {'message': f'{nickname} s-a alăturat chat-ului!'}, exclude_nickname=nickname)
+        
+        # Bucla principală pentru mesaje
         while True:
-            data = client_socket.recv(1024)
+            data = client_socket.recv(4096)
             if not data:
                 break
             
-            message = data.decode('utf-8')
-            print(f"[{address}] {message}")
+            msg = json.loads(data.decode('utf-8'))
+            msg_type = msg['type']
             
-            broadcast_msg = f"[{address}]: {message}".encode('utf-8')
-            broadcast(broadcast_msg)
+            if msg_type == 'broadcast':
+                print(f"[BROADCAST] {nickname}: {msg['data']['message']}")
+                broadcast('message', {'from': nickname, 'message': msg['data']['message'], 'type': 'broadcast'})
+            
+            elif msg_type == 'private':
+                target = msg['data']['to']
+                message = msg['data']['message']
+                print(f"[PRIVAT] {nickname} -> {target}: {message}")
+                
+                with clients_lock:
+                    if target in clients:
+                        send_to_client(clients[target]['socket'], 'message', 
+                                      {'from': nickname, 'message': message, 'type': 'private'})
+                        send_to_client(client_socket, 'message', 
+                                      {'from': f'Tu -> {target}', 'message': message, 'type': 'private_sent'})
+                    else:
+                        send_to_client(client_socket, 'error', {'message': f'Utilizatorul {target} nu există!'})
+            
+            elif msg_type == 'list_users':
+                users = get_user_list()
+                send_to_client(client_socket, 'user_list', {'users': users})
+            
+            elif msg_type == 'my_info':
+                with clients_lock:
+                    info = clients.get(nickname)
+                    if info:
+                        send_to_client(client_socket, 'info', 
+                                      {'nickname': nickname, 'ip': info['address'][0], 'port': info['address'][1]})
     
     except ConnectionResetError:
-        print(f"[DECONECTARE] {address} s-a deconectat brusc.")
+        print(f"[DECONECTARE] {nickname or address} s-a deconectat brusc.")
+    except json.JSONDecodeError:
+        print(f"[EROARE] Mesaj invalid de la {nickname or address}")
     except Exception as e:
-        print(f"[EROARE] {address}: {e}")
+        print(f"[EROARE] {nickname or address}: {e}")
     finally:
-        with clients_lock:
-            if client_socket in clients:
-                clients.remove(client_socket)
+        if nickname:
+            with clients_lock:
+                if nickname in clients:
+                    del clients[nickname]
+            broadcast('notification', {'message': f'{nickname} a părăsit chat-ul.'})
+            print(f"[DECONECTAT] {nickname} a închis conexiunea.")
         client_socket.close()
-        print(f"[DECONECTAT] {address} a închis conexiunea.")
 
 
 def main():
@@ -71,8 +134,8 @@ def main():
         print("\n[SERVER OPRIT] Închidere...")
     finally:
         with clients_lock:
-            for client in clients:
-                client.close()
+            for nickname, info in clients.items():
+                info['socket'].close()
         server_socket.close()
 
 
