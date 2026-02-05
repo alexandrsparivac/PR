@@ -18,6 +18,9 @@ Aplicație de consolă pentru comunicarea cu un magazin online via API HTTP.
 
 ## Instalare și Rulare
 
+
+
+
 ### Dependințe
 ```bash
 pip install requests
